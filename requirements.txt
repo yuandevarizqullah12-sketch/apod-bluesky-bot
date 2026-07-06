@@ -1,0 +1,5 @@
+atproto
+python-dotenv
+requests
+Pillow
+grapheme
