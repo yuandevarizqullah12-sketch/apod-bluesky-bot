@@ -1,8 +1,11 @@
 {
   "last_date": "2026-07-06",
   "keys": [
-    "518bd6c8d7182b77e3f2fe8872fd369a7afc4a502ebcad68f88690f2d0e058ac"
+    "518bd6c8d7182b77e3f2fe8872fd369a7afc4a502ebcad68f88690f2d0e058ac",
+    "fc3173b8de5898843f8165966e6a7802f95503311e9982b16ca4e7b277a88ae5"
   ],
   "is_posting": false,
+  "last_daily_post": "2026-07-06",
+  "last_flashback_post": null,
   "posting": false
 }
