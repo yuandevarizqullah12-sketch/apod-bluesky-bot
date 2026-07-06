@@ -1,10 +1,18 @@
+#!/usr/bin/env python3
+"""
+NASA APOD Bluesky Bot – GitHub Actions Edition
+Run with: python apod.py daily   or   python apod.py flashback
+"""
+
 import os
+import sys
 import time
 import json
 import hashlib
 import logging
 import tempfile
 import re
+import subprocess
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable
@@ -13,10 +21,10 @@ import requests
 from PIL import Image
 from dotenv import load_dotenv
 from atproto import Client
-from grapheme import length, slice  # new for grapheme awareness
+from grapheme import length, slice
 
 # =====================
-# LOGGING SETUP
+# LOGGING
 # =====================
 logging.basicConfig(
     level=logging.INFO,
@@ -26,19 +34,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================
-# LOAD ENV
+# ENV
 # =====================
 load_dotenv()
 
 NASA_API_KEY = os.getenv("NASA_API_KEY")
 BSKY_HANDLE = os.getenv("BSKY_HANDLE")
 BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")   # provided by GitHub Actions
 
 STATE_FILE = "data.json"
 APOD_URL = "https://api.nasa.gov/planetary/apod"
 
 # =====================
-# RETRY DECORATOR (reused)
+# RETRY DECORATOR
 # =====================
 def retry_call(func: Callable, *args, retries: int = 3, delay: float = 2.0, backoff: float = 2.0, **kwargs) -> Any:
     """Execute a callable with exponential backoff retries."""
@@ -61,20 +70,19 @@ _session = requests.Session()
 _session.headers.update({"User-Agent": "NASA-APOD-Bot/1.0"})
 
 def get_with_retry(url: str, params: Optional[Dict] = None, timeout: int = 20) -> requests.Response:
-    """GET request with retries."""
     def _get():
         return _session.get(url, params=params, timeout=timeout)
     return retry_call(_get, retries=3, delay=1)
 
 # =====================
-# STATE SAFE LOAD / SAVE (atomic)
+# STATE (atomic load/save)
 # =====================
 DEFAULT_STATE = {
     "last_date": None,
     "keys": [],
     "is_posting": False,
-    "last_daily_post": None,      # new
-    "last_flashback_post": None   # new
+    "last_daily_post": None,
+    "last_flashback_post": None
 }
 
 def load_state() -> Dict[str, Any]:
@@ -99,6 +107,7 @@ def save_state(state: Dict[str, Any]) -> None:
             json.dump(state, tf, indent=2)
             temp_name = tf.name
         os.replace(temp_name, STATE_FILE)
+        logger.debug("State saved atomically")
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
         raise
@@ -110,7 +119,6 @@ def fetch_apod(date: Optional[str] = None) -> Dict[str, Any]:
     params = {"api_key": NASA_API_KEY}
     if date:
         params["date"] = date
-
     r = get_with_retry(APOD_URL, params=params)
     r.raise_for_status()
     return r.json()
@@ -122,39 +130,31 @@ def fetch_random_apod() -> Dict[str, Any]:
     return fetch_apod(f"{y}-{m:02d}-{d:02d}")
 
 # =====================
-# SMART TEXT CUT (improved punctuation)
+# TEXT UTILITIES
 # =====================
 def smart_cut(text: str, limit: int = 260) -> str:
-    # Split on ., !, ? followed by whitespace
     sentences = re.split(r'(?<=[.!?])\s+', text)
     result = ""
-
     for s in sentences:
         if len(result + s) > limit:
             break
         result += s + ". " if s else ""
-
     return result.strip()
 
-# =====================
-# GRAPHEME‑AWARE TRUNCATION (new)
-# =====================
 def grapheme_truncate(text: str, limit: int = 300) -> str:
     if length(text) <= limit:
         return text
     return slice(text, 0, limit)
 
 # =====================
-# FORMAT POST (with grapheme limit)
+# POST FORMAT
 # =====================
 def format_apod(apod: Dict[str, Any], mode: str = "daily") -> str:
     title = apod.get("title", "")
     date = apod.get("date", "")
     explanation = smart_cut(apod.get("explanation", ""), 180)
     credit = apod.get("copyright", "NASA")
-
     link = "https://apod-web.vercel.app" if mode == "daily" else apod.get("url", "")
-
     text = f"""🌌 NASA APOD
 📅 {date}
 ✨ {title}
@@ -164,8 +164,7 @@ def format_apod(apod: Dict[str, Any], mode: str = "daily") -> str:
 👤 {credit}
 🔗 {link}
 """
-
-    return grapheme_truncate(text, 300)   # 300 graphemes (Bluesky limit)
+    return grapheme_truncate(text, 300)
 
 # =====================
 # DUPLICATE SYSTEM
@@ -187,27 +186,22 @@ def save_key(state: Dict[str, Any], key: str) -> None:
     save_state(state)
 
 # =====================
-# IMAGE COMPRESSION (with resource cleanup)
+# IMAGE COMPRESSION
 # =====================
 def compress_image(url: str) -> bytes:
     img_data = get_with_retry(url, timeout=30).content
     img = Image.open(BytesIO(img_data))
-
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-
     img.thumbnail((1400, 1400))
-
     buffer = BytesIO()
     img.save(buffer, format="JPEG", quality=75, optimize=True)
     buffer.seek(0)
-
-    img.close()   # free resources
-
+    img.close()
     return buffer.read()
 
 # =====================
-# BLUESKY POST (with retry for upload)
+# BLUESKY
 # =====================
 def upload_image(client: Client, url: str) -> Any:
     img = compress_image(url)
@@ -215,17 +209,12 @@ def upload_image(client: Client, url: str) -> Any:
 
 def post(client: Client, text: str, media_type: str, image_url: Optional[str] = None) -> None:
     if media_type == "image" and image_url:
-        # Reuse the retry mechanism for blob upload
         blob = retry_call(upload_image, client, image_url, retries=3, delay=2)
-
         client.send_post(
             text=text,
             embed={
                 "$type": "app.bsky.embed.images",
-                "images": [{
-                    "alt": "NASA APOD",
-                    "image": blob
-                }]
+                "images": [{"alt": "NASA APOD", "image": blob}]
             }
         )
     else:
@@ -235,10 +224,10 @@ def post(client: Client, text: str, media_type: str, image_url: Optional[str] = 
 # SAFE POST ENGINE
 # =====================
 def safe_post(client: Client, state: Dict[str, Any], text: str, key: str,
-              media_type: str, image_url: Optional[str] = None) -> None:
+              media_type: str, image_url: Optional[str] = None) -> bool:
     if not can_post(state, key):
         logger.info("🚫 Duplicate skipped")
-        return
+        return False
 
     try:
         state["is_posting"] = True
@@ -248,130 +237,135 @@ def safe_post(client: Client, state: Dict[str, Any], text: str, key: str,
 
         save_key(state, key)
         logger.info("✅ Posted successfully")
+        return True
 
     except Exception as e:
         logger.error(f"💥 Post error: {e}")
-
+        return False
     finally:
         state["is_posting"] = False
         save_state(state)
 
 # =====================
-# WAIT FOR DAILY UPDATE
+# JOB FUNCTIONS
 # =====================
-def wait_for_new_apod(last_date: Optional[str]) -> Dict[str, Any]:
-    while True:
-        try:
-            apod = fetch_apod()
-            if apod["date"] != last_date:
-                return apod
-            logger.info("⏳ Waiting NASA update...")
-            time.sleep(3600)
-        except Exception as e:
-            logger.error(f"Error fetching APOD: {e}, retrying in 1 hour")
-            time.sleep(3600)
+def run_daily(client: Client, state: Dict[str, Any]) -> bool:
+    """Run the daily APOD job. Returns True if state changed."""
+    # Get today's UTC date
+    today = datetime.utcnow().strftime("%Y-%m-%d")
 
-# =====================
-# JOBS (with extra safety fields)
-# =====================
-def run_daily(client: Client, state: Dict[str, Any]) -> None:
-    apod = wait_for_new_apod(state.get("last_date"))
+    # Fetch latest APOD (may be today or earlier)
+    apod = fetch_apod()
+    apod_date = apod["date"]
 
-    # Extra safety: skip if we already posted this APOD date
-    if state.get("last_daily_post") == apod["date"]:
-        logger.info("⏭️ Daily post for this date already done")
-        return
+    # If APOD date is not today, NASA hasn't updated yet
+    if apod_date != today:
+        logger.info(f"NASA APOD not available yet (latest: {apod_date}, today: {today})")
+        return False
+
+    # Already posted today?
+    if state.get("last_daily_post") == apod_date:
+        logger.info("⏭️ Daily post for today already done")
+        return False
 
     text = format_apod(apod, "daily")
     key = make_key("daily", apod["date"], text)
 
-    safe_post(client, state, text, key, apod["media_type"], apod["url"])
+    success = safe_post(client, state, text, key, apod["media_type"], apod["url"])
+    if success:
+        state["last_date"] = apod["date"]
+        state["last_daily_post"] = apod["date"]
+        save_state(state)
+    return success
 
-    state["last_date"] = apod["date"]
-    state["last_daily_post"] = apod["date"]
-    save_state(state)
+def run_flashback(client: Client, state: Dict[str, Any]) -> bool:
+    """Run the flashback job. Returns True if state changed."""
+    # Try up to 10 random APODs to find a unique one
+    for _ in range(10):
+        apod = fetch_random_apod()
+        text = format_apod(apod, "flashback")
+        key = make_key("flashback", apod["date"], text)
 
-def run_flashback(client: Client, state: Dict[str, Any]) -> None:
-    apod = fetch_random_apod()
+        if can_post(state, key):
+            # Also check if we already posted this exact date as a flashback
+            if state.get("last_flashback_post") == apod["date"]:
+                continue
+            success = safe_post(client, state, text, key, apod["media_type"], apod["url"])
+            if success:
+                state["last_flashback_post"] = apod["date"]
+                save_state(state)
+            return success
+        else:
+            logger.info(f"Flashback candidate {apod['date']} already posted, trying another")
 
-    if state.get("last_flashback_post") == apod["date"]:
-        logger.info("⏭️ Flashback for this date already done")
+    logger.warning("Could not find a unique flashback APOD after 10 attempts")
+    return False
+
+# =====================
+# GIT COMMIT (for state persistence)
+# =====================
+def commit_state_if_changed() -> None:
+    """Commit data.json if it has changed, and push using GITHUB_TOKEN."""
+    if not GITHUB_TOKEN:
+        logger.info("No GITHUB_TOKEN found – skipping git commit (local run)")
         return
 
-    text = format_apod(apod, "flashback")
-    key = make_key("flashback", apod["date"], text)
+    # Check if the file has changes
+    try:
+        status = subprocess.check_output(["git", "status", "--porcelain", STATE_FILE], text=True).strip()
+        if not status:
+            logger.debug("No changes to data.json")
+            return
+    except Exception as e:
+        logger.error(f"Git status check failed: {e}")
+        return
 
-    safe_post(client, state, text, key, apod["media_type"], apod["url"])
-
-    state["last_flashback_post"] = apod["date"]
-    save_state(state)
-
-# =====================
-# SCHEDULER (with periodic sleep)
-# =====================
-def sleep_until(hour: int) -> None:
-    """Sleep until the next occurrence of the given hour, waking every hour."""
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=hour, minute=0, second=0)
-
-        if target <= now:
-            target += timedelta(days=1)
-
-        remaining = (target - now).seconds
-        if remaining <= 0:
-            break
-        # Sleep in chunks of at most 3600 seconds to keep Railway alive
-        sleep_chunk = min(remaining, 3600)
-        time.sleep(sleep_chunk)
-        # Recalculate after waking (in case system time changed)
-        if datetime.now() >= target:
-            break
-
-def scheduler(client: Client) -> None:
-    state = load_state()
-
-    while True:
-        try:
-            now = datetime.now()
-
-            if now.hour == 12:
-                logger.info("🚀 DAILY MODE")
-                run_daily(client, state)
-                sleep_until(19)
-
-            elif now.hour == 20:
-                logger.info("🚀 FLASHBACK MODE")
-                run_flashback(client, state)
-                sleep_until(12)
-
-            else:
-                time.sleep(30)
-
-        except Exception as e:
-            logger.error(f"💥 Scheduler error: {e}")
-            time.sleep(10)
+    # Configure git (use the token for authentication)
+    repo_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{os.environ.get('GITHUB_REPOSITORY')}.git"
+    try:
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True)
+        subprocess.run(["git", "add", STATE_FILE], check=True)
+        subprocess.run(["git", "commit", "-m", "Update APOD state [skip ci]"], check=True)
+        subprocess.run(["git", "push", repo_url, "HEAD"], check=True)
+        logger.info("State committed and pushed to repository")
+    except Exception as e:
+        logger.error(f"Git commit/push failed: {e}")
 
 # =====================
-# AUTO RESTART (with retried login)
+# MAIN ENTRY
 # =====================
 def main() -> None:
-    client = Client()
+    if len(sys.argv) != 2:
+        print("Usage: python apod.py [daily|flashback]")
+        sys.exit(1)
 
-    # Reuse retry_call for login
+    mode = sys.argv[1].lower()
+    if mode not in ("daily", "flashback"):
+        print("Invalid mode. Choose 'daily' or 'flashback'.")
+        sys.exit(1)
+
+    # Load state
+    state = load_state()
+
+    # Login to Bluesky (with retries)
+    client = Client()
     retry_call(client.login, BSKY_HANDLE, BSKY_PASSWORD, retries=3, delay=2)
 
-    while True:
-        try:
-            logger.info("🚀 BOT STARTED")
-            scheduler(client)
+    # Run the selected job
+    changed = False
+    if mode == "daily":
+        changed = run_daily(client, state)
+    else:  # flashback
+        changed = run_flashback(client, state)
 
-        except Exception as e:
-            logger.critical(f"💥 FATAL: {e}")
-            time.sleep(10)
+    # If state was updated, commit the change for next workflow run
+    if changed:
+        commit_state_if_changed()
+    else:
+        logger.info("No state change – nothing to commit")
 
-# =====================
-# RUN
-# =====================
+    logger.info(f"Job '{mode}' finished. Exiting.")
+
 if __name__ == "__main__":
     main()
