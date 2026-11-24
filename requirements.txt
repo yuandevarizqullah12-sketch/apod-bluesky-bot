@@ -1,5 +1,5 @@
-requests>=2.28.0
-Pillow>=9.0.0
-python-dotenv>=0.19.0
-atproto>=0.0.30
-grapheme>=0.6.0
+requests>=2.31,<3
+Pillow>=10.3,<13
+atproto>=0.0.60,<0.1
+grapheme>=0.6,<0.7
+python-dotenv>=1.0,<2
